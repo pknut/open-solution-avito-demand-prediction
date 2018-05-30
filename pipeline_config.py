@@ -3,6 +3,8 @@ import os
 
 from attrdict import AttrDict
 from deepsense import neptune
+from nltk.corpus import stopwords
+import numpy as np
 
 from utils import read_params, safe_eval
 
@@ -35,7 +37,7 @@ USER_ID_COLUMN = ['user_id']
 FEATURES_TO_TRANSLATE = ['category_name', 'city', 'description', 'param_1', 'param_2', 'param_3',
                          'parent_category_name', 'region', 'title']
 
-DEV_SAMPLE_SIZE = int(10e3)
+DEV_SAMPLE_SIZE = int(10e1)
 
 COLUMN_TYPES = {'train': {'price': 'float64',
                           'item_seq_number': 'uint32',
@@ -93,14 +95,20 @@ SOLUTION_CONFIG = AttrDict({
                                                   }
                                     }
                       },
-    'dataframe_by_type_splitter': {'numerical_columns': NUMERICAL_COLUMNS,
-                                   'categorical_columns': CATEGORICAL_COLUMNS,
-                                   'timestamp_columns': TIMESTAMP_COLUMNS,
-                                   },
+
+    'input_missing': {'text_columns': (TEXT_COLUMNS, '<this_is_missing_value>'),
+                      'categorical_columns': (CATEGORICAL_COLUMNS, '-9999'),
+                      'numerical_columns': (NUMERICAL_COLUMNS, 0),
+                      'timestamp_columns': (TIMESTAMP_COLUMNS, '2017-03-15')
+                      },
 
     'date_features': {'date_column': TIMESTAMP_COLUMNS[0]},
     'is_missing': {'columns': FEATURE_COLUMNS},
     'categorical_encoder': {},
+    'groupby_aggregation': {'groupby_aggregations': AGGREGATION_RECIPIES
+                            },
+    'target_encoder': {'n_splits': safe_eval(params.target_encoder__n_splits),
+                       },
 
     'text_features': {'cols': ['description', 'title']},
     'word_overlap': {'overlap_cols': [('description', 'title'),
@@ -115,17 +123,32 @@ SOLUTION_CONFIG = AttrDict({
                                       ('title', 'param_2'),
                                       ('title', 'param_3'),
                                       ]},
+    'tfidf': {'cols_params': [('description', {'ngram_range': (1, 2),
+                                               'max_features': 16000,
+                                               "stop_words": set(stopwords.words('english')),
+                                               "analyzer": 'word',
+                                               "token_pattern": r'\w{1,}',
+                                               "sublinear_tf": True,
+                                               "dtype": np.float32,
+                                               "norm": 'l2',
+                                               "smooth_idf": False
+                                               }),
+                              ('title', {'ngram_range': (1, 2),
+                                         'max_features': 8000,
+                                         "stop_words": set(stopwords.words('english')),
+                                         "analyzer": 'word',
+                                         "token_pattern": r'\w{1,}',
+                                         "sublinear_tf": True,
+                                         "dtype": np.float32,
+                                         "norm": 'l2',
+                                         "smooth_idf": False
+                                         })]},
 
-    'text_cleaner': {'text_features': ['description', 'title'],
-                     'drop_punctuation': True,
-                     'all_lower_case': True
-                     },
-
-    'groupby_aggregation': {'groupby_aggregations': AGGREGATION_RECIPIES
-                            },
-
-    'target_encoder': {'n_splits': safe_eval(params.target_encoder__n_splits),
-                       },
+    'image_stats': {'cols': IMAGE_COLUMNS,
+                    'img_dir_train': params.train_image_dir,
+                    'img_dir_test': params.test_image_dir,
+                    'log_features': True,
+                    'n_jobs': params.num_workers},
 
     'light_gbm': {'boosting_type': safe_eval(params.lgbm__boosting_type),
                   'objective': safe_eval(params.lgbm__objective),

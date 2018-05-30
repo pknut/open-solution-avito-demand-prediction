@@ -1,13 +1,18 @@
+import os
 import re
 import string
-from itertools import combinations
+from multiprocessing import Pool
 
 import category_encoders as ce
+import cv2
 import numpy as np
 import pandas as pd
+from PIL import Image, ImageStat
 from sklearn.model_selection import KFold
 from sklearn.externals import joblib
 from sklearn import preprocessing as prep
+from sklearn.feature_extraction import text
+from scipy.sparse import hstack, csr_matrix
 
 from steps.base import BaseTransformer
 from steps.utils import get_logger
@@ -37,14 +42,23 @@ class DataFrameByTypeSplitter(BaseTransformer):
 
 
 class FeatureJoiner(BaseTransformer):
-    def transform(self, numerical_feature_list, categorical_feature_list, **kwargs):
+    def transform(self, numerical_feature_list, categorical_feature_list, sparse_feature_list, **kwargs):
         features = numerical_feature_list + categorical_feature_list
         for feature in features:
             feature.reset_index(drop=True, inplace=True)
+        dense_features = pd.concat(features, axis=1).astype(np.float32)
+
         outputs = {}
-        outputs['features'] = pd.concat(features, axis=1).astype(np.float32)
-        outputs['feature_names'] = self._get_feature_names(features)
-        outputs['categorical_features'] = self._get_feature_names(categorical_feature_list)
+        if len(sparse_feature_list) != 0:
+            sparse_features = hstack(sparse_feature_list)
+            all_features = hstack([csr_matrix(dense_features.values), sparse_features])
+            outputs['features'] = all_features
+            outputs['feature_names'] = list(dense_features.columns) + self._get_sparse_names(sparse_features.shape)
+            outputs['categorical_features'] = self._get_feature_names(categorical_feature_list)
+        else:
+            outputs['features'] = dense_features
+            outputs['feature_names'] = self._get_feature_names(features)
+            outputs['categorical_features'] = self._get_feature_names(categorical_feature_list)
         return outputs
 
     def _get_feature_names(self, dataframes):
@@ -57,6 +71,9 @@ class FeatureJoiner(BaseTransformer):
                 feature_names.append(dataframe.name)
 
         return feature_names
+
+    def _get_sparse_names(self, shape):
+        return ['sparse_feature_{}'.format(i) for i in range(shape[1])]
 
 
 class CategoricalFilter(BaseTransformer):
@@ -462,6 +479,7 @@ class DateFeatures(BaseTransformer):
         date_features_names = ['{}_month'.format(self.date_column),
                                '{}_day'.format(self.date_column),
                                '{}_weekday'.format(self.date_column),
+                               '{}_week'.format(self.date_column),
                                ]
         return date_features_names
 
@@ -470,7 +488,14 @@ class DateFeatures(BaseTransformer):
         timestamp_features['{}_month'.format(self.date_column)] = date_index.month
         timestamp_features['{}_day'.format(self.date_column)] = date_index.day
         timestamp_features['{}_weekday'.format(self.date_column)] = date_index.weekday
+        timestamp_features['{}_week'.format(self.date_column)] = date_index.week
         return {'categorical_features': timestamp_features[self.date_features_names].astype(int)}
+
+
+class ProcessNumerical(BaseTransformer):
+    def transform(self, numerical_features, **kwargs):
+        numerical_features['price'] = np.log1p(numerical_features['price'].values)
+        return {'numerical_features': numerical_features}
 
 
 class Blacklist(BaseTransformer):
@@ -547,3 +572,115 @@ class ConfidenceRate(BaseTransformer):
         confidence = np.min([1, np.log(x.count()) / np.log(self.confidence_level)])
 
         return rate * confidence * 100
+
+
+class MultiColumnTfidfVectorizer(BaseTransformer):
+    def __init__(self, cols_params):
+        self.cols_vectorizers = self._get_vectorizers(cols_params)
+
+    def fit(self, X, **kwargs):
+        for col, vectorizer in self.cols_vectorizers:
+            vectorizer.fit(X[col].values)
+        return self
+
+    def transform(self, X, **kwargs):
+        sparse_features = []
+        for col, vectorizer in self.cols_vectorizers:
+            sparse_feature = vectorizer.transform(X[col].values)
+            sparse_features.append(sparse_feature)
+        sparse_features = hstack(sparse_features)
+        return {'sparse_features': sparse_features}
+
+    def load(self, filepath):
+        self.cols_vectorizers = joblib.load(filepath)
+        return self
+
+    def save(self, filepath):
+        joblib.dump(self.cols_vectorizers, filepath)
+
+    def _get_vectorizers(self, cols_params):
+        return [(col, text.TfidfVectorizer(**params)) for col, params in cols_params]
+
+
+class ImageStatistics(BaseTransformer):
+    PIL_FEATURES_NR = 12
+    CV2_FEATURES_NR = 262
+
+    def __init__(self, cols, img_dir_train, img_dir_test, n_jobs, log_features):
+        self.cols = cols
+        self.img_dir_train = img_dir_train
+        self.img_dir_test = img_dir_test
+        self.n_jobs = n_jobs
+        self.log_features = log_features
+
+    def transform(self, X, is_train, **kwargs):
+        self.train_mode = is_train
+        numerical_features = []
+        for col in self.cols:
+            numerical_features_col = self._get_column_image_stats(X[col], col)
+            numerical_features.append(numerical_features_col)
+        numerical_features = pd.concat(numerical_features, axis=1)
+        if self.log_features:
+            numerical_features = np.log1p(numerical_features)
+        return {'numerical_features': numerical_features}
+
+    def _pil_feature_names(self, colname):
+        pil_feature_names = ['{}_pil_image_stat_{}'.format(colname, i)
+                             for i in range(ImageStatistics.PIL_FEATURES_NR)]
+        return pil_feature_names
+
+    def _cv2_feature_names(self, colname):
+        cv2_feature_names = ['{}_cv2_image_stat_{}'.format(colname, i)
+                             for i in range(ImageStatistics.CV2_FEATURES_NR)]
+        return cv2_feature_names
+
+    def _get_column_image_stats(self, image_col, column_name):
+        filepaths = [self._get_filepath(filename) for filename in image_col]
+
+        with Pool(self.n_jobs) as executor:
+            image_features = executor.map(extract_image_stats, filepaths)
+
+        image_features = np.vstack(image_features)
+        feature_names = self._pil_feature_names(column_name) + self._cv2_feature_names(column_name)
+        return pd.DataFrame(image_features, columns=feature_names)
+
+    def _get_filepath(self, filename):
+        img_dir_path = self.img_dir_train if self.train_mode else self.img_dir_test
+        filepath = os.path.join(img_dir_path, '{}.jpg'.format(filename))
+        return filepath
+
+
+def extract_image_stats(filepath):
+    try:
+        pil_img_stats = get_pil_image_stats(filepath)
+        cv2_img_stats = get_cv2_image_stats(filepath)
+    except Exception:
+        pil_img_stats = [0] * ImageStatistics.PIL_FEATURES_NR
+        cv2_img_stats = [0] * ImageStatistics.CV2_FEATURES_NR
+    return np.hstack([pil_img_stats, cv2_img_stats])
+
+
+def get_pil_image_stats(filepath):
+    image = Image.open(filepath, 'r')
+    img_stats_ = ImageStat.Stat(image)
+    stats = []
+    stats += img_stats_.mean
+    stats += img_stats_.rms
+    stats += img_stats_.var
+    stats += img_stats_.stddev
+    return stats
+
+
+def get_cv2_image_stats(filepath):
+    img = cv2.imread(filepath)
+    bw = cv2.imread(filepath, 0)
+    pixel_nr = float(bw.shape[0] * bw.shape[1])
+    stats = []
+    stats += list(cv2.calcHist([bw], [0], None, [256], [0, 256]).flatten() / pixel_nr)
+    mean, std = cv2.meanStdDev(img)
+    stats += list(mean)
+    stats += list(std)
+    stats += cv2.Laplacian(bw, cv2.CV_64F).var()
+    stats += (bw < 10).mean()
+    stats += (bw > 245).mean()
+    return stats
